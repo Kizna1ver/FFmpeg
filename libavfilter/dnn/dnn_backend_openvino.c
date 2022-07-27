@@ -31,6 +31,8 @@
 #include "libavutil/opt.h"
 #include "libavutil/avstring.h"
 #include "libavutil/detection_bbox.h"
+#include "libavutil/hwcontext.h"
+#include "libavutil/hwcontext_vaapi.h"
 #include "../internal.h"
 #include "safe_queue.h"
 #include <c_api/ie_c_api.h>
@@ -55,6 +57,7 @@ typedef struct OVModel{
     ie_core_t *core;
     ie_network_t *network;
     ie_executable_network_t *exe_network;
+    ie_remote_context_t *va_context; // holds va_context
     SafeQueue *request_queue;   // holds OVRequestItem
     Queue *task_queue;          // holds TaskItem
     Queue *lltask_queue;     // holds LastLevelTaskItem
@@ -129,36 +132,62 @@ static int fill_model_input_ov(OVModel *ov_model, OVRequestItem *request)
     lltask = ff_queue_peek_front(ov_model->lltask_queue);
     av_assert0(lltask);
     task = lltask->task;
+    if (task->in_frame->format == AV_PIX_FMT_VAAPI) { // decode in cpu is AV_PIX_FMT_YUV420P
+        char *input_name = NULL;
+        ie_blob_t *nv12_blob = NULL;
+        unsigned int surface_id = (unsigned int)(uintptr_t)(task->in_frame->data[3]);
+        av_log(ctx, AV_LOG_INFO, "surface id : %d \n", surface_id);
+        status = ie_network_get_input_name(ov_model->network, 0, &input_name);
+        av_log(ctx, AV_LOG_INFO, "Input name: %s \n", input_name);
+        // we can get hw_device_ctx here by ov_model->model->filter_ctx->hw_device_ctx
+        status = ie_blob_make_memory_nv12_from_va_surface(task->in_frame->height, task->in_frame->width, ov_model->va_context, surface_id, &nv12_blob);
+        if (status != OK) {
+            fprintf(stderr, "ERROR ie_blob_make_memory_from_surface status %d, line %d\n", status, __LINE__);
+        }
+        // We can not modified frame in nv12_blob if we using ie_infer_request_set_blob.
+        // So, only nv12 data can be set as input data.
+        status = ie_infer_request_set_blob(request->infer_request, task->input_name, nv12_blob);
+        if (status != OK) {
+            fprintf(stderr, "ERROR ie_infer_request_set_blob status %d, line %d\n", status, __LINE__);
+        }
+        status = ie_blob_get_buffer(nv12_blob, &blob_buffer);
+        input.height = task->in_frame->height;// input is origin model's input format 
+        input.width = task->in_frame->width;
+        input.channels = 2;
+        input.data = blob_buffer.buffer;
+        input.dt = DNN_UINT8;
+    } else {
+    // get a ref and we can set it
+        status = ie_infer_request_get_blob(request->infer_request, task->input_name, &input_blob);
+        if (status != OK) {
+            av_log(ctx, AV_LOG_ERROR, "Failed to get input blob with name %s\n", task->input_name);
+            return DNN_GENERIC_ERROR;
+        }
 
-    status = ie_infer_request_get_blob(request->infer_request, task->input_name, &input_blob);
-    if (status != OK) {
-        av_log(ctx, AV_LOG_ERROR, "Failed to get input blob with name %s\n", task->input_name);
-        return DNN_GENERIC_ERROR;
+        status |= ie_blob_get_dims(input_blob, &dims);
+        status |= ie_blob_get_precision(input_blob, &precision);
+        if (status != OK) {
+            ie_blob_free(&input_blob);
+            av_log(ctx, AV_LOG_ERROR, "Failed to get input blob dims/precision\n");
+            return DNN_GENERIC_ERROR;
+        }
+
+        status = ie_blob_get_buffer(input_blob, &blob_buffer);
+        if (status != OK) {
+            ie_blob_free(&input_blob);
+            av_log(ctx, AV_LOG_ERROR, "Failed to get input blob buffer\n");
+            return DNN_GENERIC_ERROR;
+        }
+
+        input.height = dims.dims[2];// input is origin model's input format 
+        input.width = dims.dims[3];
+        input.channels = dims.dims[1];
+        input.data = blob_buffer.buffer;
+        input.dt = precision_to_datatype(precision); // FP32
+        // all models in openvino open model zoo use BGR as input,
+        // change to be an option when necessary.
+        input.order = DCO_BGR;
     }
-
-    status |= ie_blob_get_dims(input_blob, &dims);
-    status |= ie_blob_get_precision(input_blob, &precision);
-    if (status != OK) {
-        ie_blob_free(&input_blob);
-        av_log(ctx, AV_LOG_ERROR, "Failed to get input blob dims/precision\n");
-        return DNN_GENERIC_ERROR;
-    }
-
-    status = ie_blob_get_buffer(input_blob, &blob_buffer);
-    if (status != OK) {
-        ie_blob_free(&input_blob);
-        av_log(ctx, AV_LOG_ERROR, "Failed to get input blob buffer\n");
-        return DNN_GENERIC_ERROR;
-    }
-
-    input.height = dims.dims[2];
-    input.width = dims.dims[3];
-    input.channels = dims.dims[1];
-    input.data = blob_buffer.buffer;
-    input.dt = precision_to_datatype(precision);
-    // all models in openvino open model zoo use BGR as input,
-    // change to be an option when necessary.
-    input.order = DCO_BGR;
 
     for (int i = 0; i < ctx->options.batch_size; ++i) {
         lltask = ff_queue_pop_front(ov_model->lltask_queue);
@@ -179,7 +208,10 @@ static int fill_model_input_ov(OVModel *ov_model, OVRequestItem *request)
             }
             break;
         case DFT_ANALYTICS_DETECT:
-            ff_frame_to_dnn_detect(task->in_frame, &input, ctx);
+            if (task->in_frame->format != AV_PIX_FMT_VAAPI) {
+                // task->in_frame is bgr frame of origin resolution?
+                ff_frame_to_dnn_detect(task->in_frame, &input, ctx);
+            }
             break;
         case DFT_ANALYTICS_CLASSIFY:
             ff_frame_to_dnn_classify(task->in_frame, &input, lltask->bbox_index, ctx);
@@ -188,7 +220,7 @@ static int fill_model_input_ov(OVModel *ov_model, OVRequestItem *request)
             av_assert0(!"should not reach here");
             break;
         }
-        input.data = (uint8_t *)input.data
+        input.data = (uint8_t *)input.data // what does this mean? change input.data will not affect blob in infer_request
                      + input.width * input.height * input.channels * get_datatype_size(input.dt);
     }
     ie_blob_free(&input_blob);
@@ -213,6 +245,16 @@ static void infer_completion_callback(void *args)
 
     status = ie_infer_request_get_blob(request->infer_request, task->output_names[0], &output_blob);
     if (status != OK) {
+        //incorrect output name
+        char *model_output_name = NULL;
+        char *all_output_names = NULL;
+        size_t model_output_count = 0;
+        av_log(ctx, AV_LOG_ERROR, "Failed to get model output data\n");
+        status = ie_network_get_outputs_number(ov_model->network, &model_output_count);
+        for (size_t i = 0; i < model_output_count; i++) {
+            status = ie_network_get_output_name(ov_model->network, i, &model_output_name);
+            APPEND_STRING(all_output_names, model_output_name)
+        }
         av_log(ctx, AV_LOG_ERROR,
                "output \"%s\" may not correct, all output(s) are: \"%s\"\n",
                task->output_names[0], ov_model->all_output_names);
@@ -293,7 +335,7 @@ static void infer_completion_callback(void *args)
     }
 }
 
-static int init_model_ov(OVModel *ov_model, const char *input_name, const char *output_name)
+static int init_model_ov(OVModel *ov_model, const AVFrame* input_frame, const char *input_name, const char *output_name)
 {
     int ret = 0;
     OVContext *ctx = &ov_model->ctx;
@@ -303,7 +345,7 @@ static int init_model_ov(OVModel *ov_model, const char *input_name, const char *
     char *all_dev_names = NULL;
 
     // batch size
-    if (ctx->options.batch_size <= 0) {
+    if (ctx->options.batch_size <= 0) { // TODO add option full gpu?
         ctx->options.batch_size = 1;
     }
 
@@ -332,7 +374,7 @@ static int init_model_ov(OVModel *ov_model, const char *input_name, const char *
             av_log(ctx, AV_LOG_ERROR, "Could not find \"%s\" in model, failed to set input layout as NHWC, "\
                                       "all input(s) are: \"%s\"\n", input_name, ov_model->all_input_names);
         } else{
-            av_log(ctx, AV_LOG_ERROR, "Failed to set layout as NHWC for input %s\n", input_name);
+        av_log(ctx, AV_LOG_ERROR, "Failed to set layout as NHWC for input %s\n", input_name);
         }
         ret = DNN_GENERIC_ERROR;
         goto err;
@@ -343,7 +385,7 @@ static int init_model_ov(OVModel *ov_model, const char *input_name, const char *
             av_log(ctx, AV_LOG_ERROR, "Could not find \"%s\" in model, failed to set output layout as NHWC, "\
                                       "all output(s) are: \"%s\"\n", input_name, ov_model->all_output_names);
         } else{
-            av_log(ctx, AV_LOG_ERROR, "Failed to set layout as NHWC for output %s\n", output_name);
+        av_log(ctx, AV_LOG_ERROR, "Failed to set layout as NHWC for output %s\n", output_name);
         }
         ret = DNN_GENERIC_ERROR;
         goto err;
@@ -353,7 +395,7 @@ static int init_model_ov(OVModel *ov_model, const char *input_name, const char *
     // we don't have a AVPixelFormat to describe it, so we'll use AV_PIX_FMT_BGR24 and
     // ask openvino to do the conversion internally.
     // the current supported SR model (frame processing) is generated from tensorflow model,
-    // and its input is Y channel as float with range [0.0f, 1.0f], so do not set for this case.
+    // and its input is Y channel as float with range [0.0f, 1.0f], so do not set for this case. // YUV is float ?
     // TODO: we need to get a final clear&general solution with all backends/formats considered.
     if (ov_model->model->func_type != DFT_PROCESS_FRAME) {
         status = ie_network_set_input_precision(ov_model->network, input_name, U8);
@@ -363,8 +405,51 @@ static int init_model_ov(OVModel *ov_model, const char *input_name, const char *
             goto err;
         }
     }
+// if do not pass input_frame as parameter we can use ov_model->model->filter_ctx->hw_device_ctx, 
+// input_frame can be replace with input height and input width
+    if (input_frame->format == AV_PIX_FMT_VAAPI) {
+        // reshape input shapes to enable auto resize algorithm
+        input_shapes_t input_shapes;
+        status = ie_network_get_input_shapes(ov_model->network, &input_shapes);
+        if (status != OK) {
+            ret = DNN_GENERIC_ERROR;
+            goto err;
+        }
+        for (int i = 0; i < input_shapes.shape_num; i++) {
+            input_shapes.shapes[i].shape.dims[0] = ctx->options.batch_size;
+            input_shapes.shapes[i].shape.dims[2] = input_frame->height;
+            input_shapes.shapes[i].shape.dims[3] = input_frame->width;
+        }
 
-    status = ie_core_load_network(ov_model->core, ov_model->network, ctx->options.device_type, &config, &ov_model->exe_network);
+        status = ie_network_reshape(ov_model->network, input_shapes);
+        ie_network_input_shapes_free(&input_shapes);
+        if (status != OK) {
+            ret = DNN_GENERIC_ERROR;
+            goto err;
+        }
+        // pre-processing
+        // Auto resize and convert color format in openvino preprocess
+        status |= ie_network_set_input_resize_algorithm(ov_model->network, input_name, RESIZE_BILINEAR); // maybe this is useful
+        status |= ie_network_set_input_layout(ov_model->network, input_name, NCHW);
+        status |= ie_network_set_input_precision(ov_model->network, input_name, U8);
+        // set input color format to NV12 to enable automatic input color format convert to bgr,
+        // so if not use ie_network_set_color_format the input blob will keep its own color.
+        status |= ie_network_set_color_format(ov_model->network, input_name, NV12); // input info
+
+        AVBufferRef* hw_device_ctx = ov_model->model->filter_ctx->hw_device_ctx;
+        AVHWDeviceContext *hw_device_data = (AVHWDeviceContext *)hw_device_ctx ->data;
+        AVVAAPIDeviceContext *va_device_data = (AVVAAPIDeviceContext *)hw_device_data ->hwctx;
+        VADisplay display = va_device_data -> display;
+        config.name = "CLDNN_NV12_TWO_INPUTS";
+        config.value = "YES";
+        status = ie_make_shared_va_context(ov_model->core, "GPU", display, &ov_model->va_context, -1);
+        if (status != OK) {
+            ret = DNN_GENERIC_ERROR;
+            goto err;
+        }
+        status = ie_core_load_network_va(ov_model->core, ov_model->network, ov_model->va_context, &config, &ov_model->exe_network);
+    } else
+        status = ie_core_load_network(ov_model->core, ov_model->network, ctx->options.device_type, &config, &ov_model->exe_network);
     if (status != OK) {
         av_log(ctx, AV_LOG_ERROR, "Failed to load OpenVINO model network\n");
         status = ie_core_get_available_devices(ov_model->core, &a_dev);
@@ -394,7 +479,7 @@ static int init_model_ov(OVModel *ov_model, const char *input_name, const char *
         goto err;
     }
 
-    for (int i = 0; i < ctx->options.nireq; i++) {
+    for (int i = 0; i < ctx->options.nireq; i++) { // nireq means multithread infer?
         OVRequestItem *item = av_mallocz(sizeof(*item));
         if (!item) {
             ret = AVERROR(ENOMEM);
@@ -459,7 +544,7 @@ static int execute_model_ov(OVRequestItem *request, Queue *inferenceq)
 
     lltask = ff_queue_peek_front(inferenceq);
     task = lltask->task;
-    ov_model = task->model;
+    ov_model = task->model; // get ov_model from task!!!
     ctx = &ov_model->ctx;
 
     if (task->async) {
@@ -520,7 +605,7 @@ static int get_input_ov(void *model, DNNData *input, const char *input_name)
     }
 
     for (size_t i = 0; i < model_input_count; i++) {
-        status = ie_network_get_input_name(ov_model->network, i, &model_input_name);
+        status = ie_network_get_input_name(ov_model->network, i, &model_input_name); // TODO do some model input preprocess 
         if (status != OK) {
             av_log(ctx, AV_LOG_ERROR, "Failed to get No.%d input's name\n", (int)i);
             return DNN_GENERIC_ERROR;
@@ -687,11 +772,17 @@ static int get_output_ov(void *model, const char *input_name, int input_width, i
     }
 
     if (!ov_model->exe_network) {
-        ret = init_model_ov(ov_model, input_name, output_name);
+        AVFrame *dummy_frame = av_frame_alloc();
+        if (ov_model->model->filter_ctx->hw_device_ctx)
+            dummy_frame->format = AV_PIX_FMT_VAAPI;
+        dummy_frame->height = input_height;
+        dummy_frame->width = input_width;
+        ret = init_model_ov(ov_model, dummy_frame, input_name, output_name);
         if (ret != 0) {
             av_log(ctx, AV_LOG_ERROR, "Failed init OpenVINO exectuable network or inference request\n");
             return ret;
         }
+        av_frame_free(dummy_frame);
     }
 
     ret = ff_dnn_fill_gettingoutput_task(&task, &exec_params, ov_model, input_height, input_width, ctx);
@@ -824,7 +915,8 @@ int ff_dnn_execute_model_ov(const DNNModel *model, DNNExecBaseParams *exec_param
     }
 
     if (!ov_model->exe_network) {
-        ret = init_model_ov(ov_model, exec_params->input_name, exec_params->output_names[0]);
+        // load exe_network and create inference queue
+        ret = init_model_ov(ov_model, exec_params->in_frame, exec_params->input_name, exec_params->output_names[0]);
         if (ret != 0) {
             av_log(ctx, AV_LOG_ERROR, "Failed init OpenVINO exectuable network or inference request\n");
             return ret;

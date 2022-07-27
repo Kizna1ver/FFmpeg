@@ -61,8 +61,8 @@ static const AVOption dnn_detect_options[] = {
 };
 
 AVFILTER_DEFINE_CLASS(dnn_detect);
-
-static int dnn_detect_post_proc_ov(AVFrame *frame, DNNData *output, AVFilterContext *filter_ctx)
+// this function set detection result in frame->side_data
+static int dnn_detect_post_proc_ov(AVFrame *frame, DNNData *output, AVFilterContext *filter_ctx) 
 {
     DnnDetectContext *ctx = filter_ctx->priv;
     float conf_threshold = ctx->confidence;
@@ -93,7 +93,7 @@ static int dnn_detect_post_proc_ov(AVFrame *frame, DNNData *output, AVFilterCont
         return 0;
     }
 
-    header = av_detection_bbox_create_side_data(frame, nb_bboxes);
+    header = av_detection_bbox_create_side_data(frame, nb_bboxes); // frame->side_data and header with common memory
     if (!header) {
         av_log(filter_ctx, AV_LOG_ERROR, "failed to create side data with %d bounding boxes\n", nb_bboxes);
         return -1;
@@ -109,8 +109,9 @@ static int dnn_detect_post_proc_ov(AVFrame *frame, DNNData *output, AVFilterCont
         float y0     =      detections[i * detect_size + 4];
         float x1     =      detections[i * detect_size + 5];
         float y1     =      detections[i * detect_size + 6];
-
-        bbox = av_get_detection_bbox(header, i);
+        av_log(filter_ctx, AV_LOG_INFO, "header->nb_bboxes: %d , idx: %d , conf: %f, proposal_count: %d \n", header->nb_bboxes, conf, i, proposal_count);
+        // TODO maybe this is a bug if i is idx but header->nb_bboxes is count
+        bbox = av_get_detection_bbox(header, i); 
 
         if (conf < conf_threshold) {
             continue;
@@ -345,7 +346,7 @@ static const enum AVPixelFormat pix_fmts[] = {
     AV_PIX_FMT_GRAY8, AV_PIX_FMT_GRAYF32,
     AV_PIX_FMT_YUV420P, AV_PIX_FMT_YUV422P,
     AV_PIX_FMT_YUV444P, AV_PIX_FMT_YUV410P, AV_PIX_FMT_YUV411P,
-    AV_PIX_FMT_NV12,
+    AV_PIX_FMT_NV12, AV_PIX_FMT_VAAPI,
     AV_PIX_FMT_NONE
 };
 
@@ -408,6 +409,7 @@ static int dnn_detect_activate(AVFilterContext *filter_ctx)
         AVFrame *out_frame = NULL;
         async_state = ff_dnn_get_result(&ctx->dnnctx, &in_frame, &out_frame);
         if (async_state == DAST_SUCCESS) {
+             // using in_frame as next filter input rather than out_frame
             ret = ff_filter_frame(outlink, in_frame);
             if (ret < 0)
                 return ret;
