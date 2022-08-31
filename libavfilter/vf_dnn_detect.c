@@ -62,7 +62,7 @@ static const AVOption dnn_detect_options[] = {
 
 AVFILTER_DEFINE_CLASS(dnn_detect);
 
-static int dnn_detect_post_proc_ov(AVFrame *frame, DNNData *output, AVFilterContext *filter_ctx)
+static int dnn_detect_post_proc_ov(AVFrame *frame, DNNData *output, AVFilterContext *filter_ctx) 
 {
     DnnDetectContext *ctx = filter_ctx->priv;
     float conf_threshold = ctx->confidence;
@@ -110,7 +110,7 @@ static int dnn_detect_post_proc_ov(AVFrame *frame, DNNData *output, AVFilterCont
         float x1     =      detections[i * detect_size + 5];
         float y1     =      detections[i * detect_size + 6];
 
-        bbox = av_get_detection_bbox(header, i);
+        bbox = av_get_detection_bbox(header, i); 
 
         if (conf < conf_threshold) {
             continue;
@@ -345,7 +345,7 @@ static const enum AVPixelFormat pix_fmts[] = {
     AV_PIX_FMT_GRAY8, AV_PIX_FMT_GRAYF32,
     AV_PIX_FMT_YUV420P, AV_PIX_FMT_YUV422P,
     AV_PIX_FMT_YUV444P, AV_PIX_FMT_YUV410P, AV_PIX_FMT_YUV411P,
-    AV_PIX_FMT_NV12,
+    AV_PIX_FMT_NV12, AV_PIX_FMT_VAAPI,
     AV_PIX_FMT_NONE
 };
 
